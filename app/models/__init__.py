@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, event, DDL
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -224,3 +224,51 @@ class DatasetSubscription(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+
+
+class OperationChangeEvent(Base):
+    """作业记录变更时间线事件（只追加，不可修改/删除）。
+
+    排序键为 (occurred_at, id)：id 由 SQLite 自增保证单调，
+    同一业务时刻内的顺序即入库顺序，重启后不变。
+    operation_id 故意不加外键：作业被删除后时间线仍需可查。
+    """
+
+    __tablename__ = "operation_change_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    operation_id = Column(Integer, nullable=False, index=True)
+    event_type = Column(String(20), nullable=False, index=True)  # create / update / annotation_link / delete_attempt
+    outcome = Column(String(20), nullable=False, default="applied", index=True)  # applied / rejected
+    operator = Column(String(100), nullable=False)
+    occurred_at = Column(DateTime(timezone=True), nullable=False, index=True)  # 业务发生时间（UTC）
+    request_source = Column(String(200), nullable=False)
+    correlation_id = Column(String(64), nullable=False, index=True)
+    changes = Column(JSON, nullable=True)  # 脱敏后的前后差异；拒绝事件为空
+    reason = Column(String(500), nullable=True)  # 拒绝原因
+    created_at = Column(DateTime(timezone=True), server_default=func.now())  # 系统落库时间
+
+
+# 数据库层兜底：时间线表禁止更新和删除，保证不可变性。
+event.listen(
+    OperationChangeEvent.__table__,
+    "after_create",
+    DDL("""
+        CREATE TRIGGER IF NOT EXISTS trg_op_change_events_no_update
+        BEFORE UPDATE ON operation_change_events
+        BEGIN
+            SELECT RAISE(ABORT, 'operation_change_events 为只追加表，禁止更新');
+        END;
+    """),
+)
+event.listen(
+    OperationChangeEvent.__table__,
+    "after_create",
+    DDL("""
+        CREATE TRIGGER IF NOT EXISTS trg_op_change_events_no_delete
+        BEFORE DELETE ON operation_change_events
+        BEGIN
+            SELECT RAISE(ABORT, 'operation_change_events 为只追加表，禁止删除');
+        END;
+    """),
+)

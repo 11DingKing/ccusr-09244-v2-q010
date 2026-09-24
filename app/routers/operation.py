@@ -4,14 +4,34 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
 from app.database import get_db
-from app.models import OperationData, RobotModel, Scene, Skill, Annotation
+from app.models import OperationData, RobotModel, Scene, Skill, Annotation, DatasetItem
 from app.schemas.operation import (
     OperationDataCreate, OperationDataUpdate, OperationDataResponse,
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
     AnnotationCreate, AnnotationUpdate, AnnotationResponse
 )
+from app.services.change_timeline import (
+    DELETE_ROLES,
+    DELETE_SNAPSHOT_FIELDS,
+    ANNOTATION_TRACKED_FIELDS,
+    OPERATION_TRACKED_FIELDS,
+    EVENT_ANNOTATION_LINK,
+    EVENT_CREATE,
+    EVENT_DELETE_ATTEMPT,
+    EVENT_UPDATE,
+    OUTCOME_APPLIED,
+    OUTCOME_REJECTED,
+    RequestContext,
+    build_changes,
+    get_request_context,
+    record_event,
+)
 
 router = APIRouter()
+
+
+def _operation_snapshot(operation: OperationData, fields=OPERATION_TRACKED_FIELDS) -> dict:
+    return {name: getattr(operation, name, None) for name in fields}
 
 
 @router.get("/operations", response_model=OperationDataListResponse, tags=["作业数据"])
@@ -74,7 +94,11 @@ def get_operation_data(operation_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/operations", response_model=OperationDataResponse, tags=["作业数据"])
-def create_operation_data(data: OperationDataCreate, db: Session = Depends(get_db)):
+def create_operation_data(
+    data: OperationDataCreate,
+    db: Session = Depends(get_db),
+    ctx: RequestContext = Depends(get_request_context),
+):
     robot_model = db.query(RobotModel).filter(RobotModel.id == data.robot_model_id).first()
     if not robot_model:
         raise HTTPException(status_code=400, detail="机型不存在")
@@ -85,15 +109,25 @@ def create_operation_data(data: OperationDataCreate, db: Session = Depends(get_d
     if not skill:
         raise HTTPException(status_code=400, detail="技能不存在")
 
-    operation = OperationData(**data.model_dump())
+    payload = data.model_dump()
+    operation = OperationData(**payload)
     db.add(operation)
+    db.flush()
+    record_event(
+        db, ctx, operation.id, EVENT_CREATE,
+        changes=build_changes(OPERATION_TRACKED_FIELDS, {}, payload),
+    )
     db.commit()
     db.refresh(operation)
     return operation
 
 
 @router.post("/operations/batch", response_model=BatchOperationResponse, tags=["作业数据"])
-def create_operation_data_batch(data_list: List[OperationDataCreate], db: Session = Depends(get_db)):
+def create_operation_data_batch(
+    data_list: List[OperationDataCreate],
+    db: Session = Depends(get_db),
+    ctx: RequestContext = Depends(get_request_context),
+):
     total = len(data_list)
     results: List[BatchOperationResultItem] = []
     success_count = 0
@@ -135,6 +169,10 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
             operation = OperationData(**data.model_dump())
             db.add(operation)
             db.flush()
+            record_event(
+                db, ctx, operation.id, EVENT_CREATE,
+                changes=build_changes(OPERATION_TRACKED_FIELDS, {}, data.model_dump()),
+            )
             db.refresh(operation)
             db.commit()
             success_count += 1
@@ -161,23 +199,62 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
 
 
 @router.put("/operations/{operation_id}", response_model=OperationDataResponse, tags=["作业数据"])
-def update_operation_data(operation_id: int, data: OperationDataUpdate, db: Session = Depends(get_db)):
+def update_operation_data(
+    operation_id: int,
+    data: OperationDataUpdate,
+    db: Session = Depends(get_db),
+    ctx: RequestContext = Depends(get_request_context),
+):
     operation = db.query(OperationData).filter(OperationData.id == operation_id).first()
     if not operation:
         raise HTTPException(status_code=404, detail="作业数据不存在")
     update_data = data.model_dump(exclude_unset=True)
+    before = _operation_snapshot(operation)
     for field, value in update_data.items():
         setattr(operation, field, value)
+    changes = build_changes(OPERATION_TRACKED_FIELDS, before, _operation_snapshot(operation))
+    if changes:
+        record_event(db, ctx, operation.id, EVENT_UPDATE, changes=changes)
     db.commit()
     db.refresh(operation)
     return operation
 
 
 @router.delete("/operations/{operation_id}", tags=["作业数据"])
-def delete_operation_data(operation_id: int, db: Session = Depends(get_db)):
+def delete_operation_data(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    ctx: RequestContext = Depends(get_request_context),
+):
     operation = db.query(OperationData).filter(OperationData.id == operation_id).first()
     if not operation:
         raise HTTPException(status_code=404, detail="作业数据不存在")
+
+    if ctx.role not in DELETE_ROLES:
+        record_event(
+            db, ctx, operation.id, EVENT_DELETE_ATTEMPT,
+            outcome=OUTCOME_REJECTED,
+            reason=f"角色 {ctx.role} 无权删除作业数据",
+        )
+        db.commit()
+        raise HTTPException(status_code=403, detail="当前角色无权删除作业数据")
+
+    reference_count = db.query(DatasetItem).filter(DatasetItem.operation_data_id == operation_id).count()
+    if reference_count:
+        record_event(
+            db, ctx, operation.id, EVENT_DELETE_ATTEMPT,
+            outcome=OUTCOME_REJECTED,
+            reason=f"作业数据被 {reference_count} 个数据集条目引用，禁止删除",
+        )
+        db.commit()
+        raise HTTPException(status_code=409, detail="作业数据已被数据集引用，无法删除")
+
+    snapshot = _operation_snapshot(operation, DELETE_SNAPSHOT_FIELDS)
+    record_event(
+        db, ctx, operation.id, EVENT_DELETE_ATTEMPT,
+        outcome=OUTCOME_APPLIED,
+        changes=build_changes(DELETE_SNAPSHOT_FIELDS, snapshot, {}),
+    )
     db.delete(operation)
     db.commit()
     return {"message": "删除成功"}
@@ -222,7 +299,11 @@ def get_annotation(annotation_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/annotations", response_model=AnnotationResponse, tags=["标注管理"])
-def create_annotation(data: AnnotationCreate, db: Session = Depends(get_db)):
+def create_annotation(
+    data: AnnotationCreate,
+    db: Session = Depends(get_db),
+    ctx: RequestContext = Depends(get_request_context),
+):
     operation = db.query(OperationData).filter(OperationData.id == data.operation_data_id).first()
     if not operation:
         raise HTTPException(status_code=400, detail="作业数据不存在")
@@ -233,31 +314,56 @@ def create_annotation(data: AnnotationCreate, db: Session = Depends(get_db)):
     if not data.is_success and not data.failure_category:
         raise HTTPException(status_code=400, detail="标注失败时必须指定失败大类")
 
-    annotation = Annotation(**data.model_dump())
+    payload = data.model_dump()
+    annotation = Annotation(**payload)
     db.add(annotation)
+    db.flush()
+    record_event(
+        db, ctx, annotation.operation_data_id, EVENT_ANNOTATION_LINK,
+        changes=build_changes(ANNOTATION_TRACKED_FIELDS, {}, payload),
+    )
     db.commit()
     db.refresh(annotation)
     return annotation
 
 
 @router.put("/annotations/{annotation_id}", response_model=AnnotationResponse, tags=["标注管理"])
-def update_annotation(annotation_id: int, data: AnnotationUpdate, db: Session = Depends(get_db)):
+def update_annotation(
+    annotation_id: int,
+    data: AnnotationUpdate,
+    db: Session = Depends(get_db),
+    ctx: RequestContext = Depends(get_request_context),
+):
     annotation = db.query(Annotation).filter(Annotation.id == annotation_id).first()
     if not annotation:
         raise HTTPException(status_code=404, detail="标注记录不存在")
     update_data = data.model_dump(exclude_unset=True)
+    before = {name: getattr(annotation, name, None) for name in ANNOTATION_TRACKED_FIELDS}
     for field, value in update_data.items():
         setattr(annotation, field, value)
+    after = {name: getattr(annotation, name, None) for name in ANNOTATION_TRACKED_FIELDS}
+    changes = build_changes(ANNOTATION_TRACKED_FIELDS, before, after)
+    if changes:
+        record_event(db, ctx, annotation.operation_data_id, EVENT_ANNOTATION_LINK, changes=changes)
     db.commit()
     db.refresh(annotation)
     return annotation
 
 
 @router.delete("/annotations/{annotation_id}", tags=["标注管理"])
-def delete_annotation(annotation_id: int, db: Session = Depends(get_db)):
+def delete_annotation(
+    annotation_id: int,
+    db: Session = Depends(get_db),
+    ctx: RequestContext = Depends(get_request_context),
+):
     annotation = db.query(Annotation).filter(Annotation.id == annotation_id).first()
     if not annotation:
         raise HTTPException(status_code=404, detail="标注记录不存在")
+    before = {name: getattr(annotation, name, None) for name in ANNOTATION_TRACKED_FIELDS}
+    record_event(
+        db, ctx, annotation.operation_data_id, EVENT_ANNOTATION_LINK,
+        changes=build_changes(ANNOTATION_TRACKED_FIELDS, before, {}),
+    )
     db.delete(annotation)
     db.commit()
     return {"message": "删除成功"}
