@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import engine, Base
-from app.routers import common, operation, dataset, analytics
+from app.routers import common, operation, dataset, analytics, audit
 
 
 def create_tables():
@@ -66,6 +66,11 @@ app = FastAPI(
 - 标注完成率、复用率
 - 失败原因分析
 - 按审核状态统计（待审/已发布等）
+
+### 不可变变更时间线
+- 追加式记录创建/局部更新/标注关联/删除尝试
+- 操作者、来源、业务时间、关联标识与脱敏前后差异
+- 失败请求只记录拒绝事实；双键游标稳定翻页；敏感载荷仅 admin 可见
     """,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -85,6 +90,7 @@ app.include_router(common.router, prefix=api_prefix)
 app.include_router(operation.router, prefix=api_prefix)
 app.include_router(dataset.router, prefix=api_prefix)
 app.include_router(analytics.router, prefix=api_prefix)
+app.include_router(audit.router, prefix=api_prefix)
 
 
 @app.get("/", tags=["首页"])

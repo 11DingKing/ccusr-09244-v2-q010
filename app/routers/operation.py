@@ -1,17 +1,103 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
 
 from app.database import get_db
-from app.models import OperationData, RobotModel, Scene, Skill, Annotation
+from app.models import OperationData, RobotModel, Scene, Skill, Annotation, DatasetItem
 from app.schemas.operation import (
     OperationDataCreate, OperationDataUpdate, OperationDataResponse,
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
     AnnotationCreate, AnnotationUpdate, AnnotationResponse
 )
+from app.services.audit import (
+    AuditContext,
+    ANNOTATION_FIELDS,
+    ANNOTATION_SENSITIVE,
+    OPERATION_FIELDS,
+    OPERATION_SENSITIVE,
+    field_changes,
+    require_writer_role,
+    normalize_for_storage,
+    record_change,
+    record_denial,
+    snapshot,
+)
 
 router = APIRouter()
+
+
+def _deny(
+    db: Session,
+    context: AuditContext,
+    *,
+    action: str,
+    status_code: int,
+    reason_code: str,
+    message: str,
+    operation_data_id: Optional[int] = None,
+    entity: str = "operation_data",
+    entity_id: Optional[int] = None,
+):
+    """记录拒绝事实并返回错误响应；拒绝事件独立事务落库。"""
+    record_denial(
+        db,
+        context,
+        action=action,
+        reason_code=reason_code,
+        reason_detail=message,
+        operation_data_id=operation_data_id,
+        entity=entity,
+        entity_id=entity_id,
+    )
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "reason_code": reason_code,
+            "message": message,
+            "correlation_id": context.correlation_id,
+        },
+    )
+
+
+def _normalize_payload(payload: dict) -> dict:
+    return {key: normalize_for_storage(value) for key, value in payload.items()}
+
+
+def _commit_or_deny(
+    db: Session,
+    context: AuditContext,
+    *,
+    action: str,
+    message: str,
+    operation_data_id: Optional[int] = None,
+    entity: str = "operation_data",
+    entity_id: Optional[int] = None,
+):
+    """提交业务事务；若数据库层拒绝（如外键约束导致删除失败），
+    丢弃半成品写入并只记录一条拒绝事实，绝不返回伪装成功。"""
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        record_denial(
+            db,
+            context,
+            action=action,
+            reason_code="commit_rejected",
+            reason_detail=f"{message}: {exc.__class__.__name__}",
+            operation_data_id=operation_data_id,
+            entity=entity,
+            entity_id=entity_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason_code": "commit_rejected",
+                "message": message,
+                "correlation_id": context.correlation_id,
+            },
+        ) from exc
 
 
 @router.get("/operations", response_model=OperationDataListResponse, tags=["作业数据"])
@@ -74,26 +160,50 @@ def get_operation_data(operation_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/operations", response_model=OperationDataResponse, tags=["作业数据"])
-def create_operation_data(data: OperationDataCreate, db: Session = Depends(get_db)):
+def create_operation_data(
+    data: OperationDataCreate,
+    db: Session = Depends(get_db),
+    context: AuditContext = Depends(require_writer_role),
+):
     robot_model = db.query(RobotModel).filter(RobotModel.id == data.robot_model_id).first()
     if not robot_model:
-        raise HTTPException(status_code=400, detail="机型不存在")
+        _deny(db, context, action="operation.create", status_code=400,
+              reason_code="invalid_reference", message=f"机型ID {data.robot_model_id} 不存在")
     scene = db.query(Scene).filter(Scene.id == data.scene_id).first()
     if not scene:
-        raise HTTPException(status_code=400, detail="场景不存在")
+        _deny(db, context, action="operation.create", status_code=400,
+              reason_code="invalid_reference", message=f"场景ID {data.scene_id} 不存在")
     skill = db.query(Skill).filter(Skill.id == data.skill_id).first()
     if not skill:
-        raise HTTPException(status_code=400, detail="技能不存在")
+        _deny(db, context, action="operation.create", status_code=400,
+              reason_code="invalid_reference", message=f"技能ID {data.skill_id} 不存在")
 
-    operation = OperationData(**data.model_dump())
+    operation = OperationData(**_normalize_payload(data.model_dump()))
     db.add(operation)
-    db.commit()
+    db.flush()
+    db.refresh(operation)
+
+    after = snapshot(operation, OPERATION_FIELDS)
+    record_change(
+        db,
+        context,
+        action="operation.create",
+        operation_data_id=operation.id,
+        changes=field_changes({}, after, OPERATION_FIELDS, OPERATION_SENSITIVE),
+        raw_after=after,
+    )
+    _commit_or_deny(db, context, action="operation.create",
+                    message="作业创建被数据库拒绝", operation_data_id=operation.id)
     db.refresh(operation)
     return operation
 
 
 @router.post("/operations/batch", response_model=BatchOperationResponse, tags=["作业数据"])
-def create_operation_data_batch(data_list: List[OperationDataCreate], db: Session = Depends(get_db)):
+def create_operation_data_batch(
+    data_list: List[OperationDataCreate],
+    db: Session = Depends(get_db),
+    context: AuditContext = Depends(require_writer_role),
+):
     total = len(data_list)
     results: List[BatchOperationResultItem] = []
     success_count = 0
@@ -123,6 +233,15 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
             errors.append(f"技能ID {data.skill_id} 不存在")
 
         if errors:
+            # 批量内的失败项同样以拒绝事件留痕，整批事件共享同一关联标识
+            record_denial(
+                db,
+                context,
+                action="operation.create",
+                reason_code="invalid_reference",
+                reason_detail=f"第{index}项: {'; '.join(errors)}",
+                operation_data_id=None,
+            )
             failure_count += 1
             results.append(BatchOperationResultItem(
                 index=index,
@@ -132,10 +251,18 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
             continue
 
         try:
-            operation = OperationData(**data.model_dump())
+            operation = OperationData(**_normalize_payload(data.model_dump()))
             db.add(operation)
             db.flush()
-            db.refresh(operation)
+            after = snapshot(operation, OPERATION_FIELDS)
+            record_change(
+                db,
+                context,
+                action="operation.create",
+                operation_data_id=operation.id,
+                changes=field_changes({}, after, OPERATION_FIELDS, OPERATION_SENSITIVE),
+                raw_after=after,
+            )
             db.commit()
             success_count += 1
             results.append(BatchOperationResultItem(
@@ -145,6 +272,14 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
             ))
         except Exception as e:
             db.rollback()
+            record_denial(
+                db,
+                context,
+                action="operation.create",
+                reason_code="persistence_error",
+                reason_detail=f"第{index}项: {e}",
+                operation_data_id=None,
+            )
             failure_count += 1
             results.append(BatchOperationResultItem(
                 index=index,
@@ -161,25 +296,102 @@ def create_operation_data_batch(data_list: List[OperationDataCreate], db: Sessio
 
 
 @router.put("/operations/{operation_id}", response_model=OperationDataResponse, tags=["作业数据"])
-def update_operation_data(operation_id: int, data: OperationDataUpdate, db: Session = Depends(get_db)):
+def update_operation_data(
+    operation_id: int,
+    data: OperationDataUpdate,
+    db: Session = Depends(get_db),
+    context: AuditContext = Depends(require_writer_role),
+):
     operation = db.query(OperationData).filter(OperationData.id == operation_id).first()
     if not operation:
-        raise HTTPException(status_code=404, detail="作业数据不存在")
-    update_data = data.model_dump(exclude_unset=True)
+        _deny(db, context, action="operation.update", status_code=404,
+              reason_code="not_found", message="作业数据不存在",
+              operation_data_id=operation_id)
+
+    before = snapshot(operation, OPERATION_FIELDS)
+    update_data = _normalize_payload(data.model_dump(exclude_unset=True))
     for field, value in update_data.items():
         setattr(operation, field, value)
-    db.commit()
+    db.flush()
+    db.refresh(operation)
+    after = snapshot(operation, OPERATION_FIELDS)
+
+    changes = field_changes(before, after, OPERATION_FIELDS, OPERATION_SENSITIVE)
+    if not changes:
+        # 无变化请求不算变更：丢弃写入，只记录被拒绝的事实
+        _deny(db, context, action="operation.update", status_code=400,
+              reason_code="no_change", message="请求没有改变任何字段",
+              operation_data_id=operation_id)
+
+    record_change(
+        db,
+        context,
+        action="operation.update",
+        operation_data_id=operation.id,
+        changes=changes,
+        raw_before=before,
+        raw_after=after,
+    )
+    _commit_or_deny(db, context, action="operation.create",
+                    message="作业创建被数据库拒绝", operation_data_id=operation.id)
     db.refresh(operation)
     return operation
 
 
 @router.delete("/operations/{operation_id}", tags=["作业数据"])
-def delete_operation_data(operation_id: int, db: Session = Depends(get_db)):
+def delete_operation_data(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    context: AuditContext = Depends(require_writer_role),
+):
     operation = db.query(OperationData).filter(OperationData.id == operation_id).first()
     if not operation:
-        raise HTTPException(status_code=404, detail="作业数据不存在")
+        # 删除尝试同样必须留痕：这是一次失败的删除，而不是静默的 404
+        _deny(db, context, action="operation.delete", status_code=404,
+              reason_code="not_found", message="作业数据不存在",
+              operation_data_id=operation_id)
+
+    before = snapshot(operation, OPERATION_FIELDS)
+    annotation = db.query(Annotation).filter(
+        Annotation.operation_data_id == operation_id
+    ).first()
+    annotation_before = snapshot(annotation, ANNOTATION_FIELDS) if annotation else None
+
+    # 被数据集引用的作业不能静默级联删除引用关系，拒绝删除并记录失败尝试
+    in_use = db.query(DatasetItem.id).filter(
+        DatasetItem.operation_data_id == operation_id
+    ).first()
+    if in_use:
+        _deny(db, context, action="operation.delete", status_code=409,
+              reason_code="in_use_by_dataset",
+              message="作业已被数据集条目引用，无法删除，请先从数据集移除",
+              operation_data_id=operation_id)
+
+    # 级联删除标注属于同一次请求产生的多项变化，与作业删除共享关联标识
+    if annotation is not None:
+        record_change(
+            db,
+            context,
+            action="annotation.delete",
+            operation_data_id=operation_id,
+            entity="annotation",
+            entity_id=annotation.id,
+            changes=field_changes(annotation_before, {}, ANNOTATION_FIELDS, ANNOTATION_SENSITIVE),
+            raw_before=annotation_before,
+        )
+    record_change(
+        db,
+        context,
+        action="operation.delete",
+        operation_data_id=operation_id,
+        changes={"existence": {"before": "present", "after": "deleted"}},
+        raw_before=before,
+    )
+
     db.delete(operation)
-    db.commit()
+    _commit_or_deny(db, context, action="operation.delete",
+                    message="作业删除被数据库拒绝，可能仍被数据集引用",
+                    operation_data_id=operation_id)
     return {"message": "删除成功"}
 
 
@@ -222,44 +434,128 @@ def get_annotation(annotation_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/annotations", response_model=AnnotationResponse, tags=["标注管理"])
-def create_annotation(data: AnnotationCreate, db: Session = Depends(get_db)):
+def create_annotation(
+    data: AnnotationCreate,
+    db: Session = Depends(get_db),
+    context: AuditContext = Depends(require_writer_role),
+):
     operation = db.query(OperationData).filter(OperationData.id == data.operation_data_id).first()
     if not operation:
-        raise HTTPException(status_code=400, detail="作业数据不存在")
+        _deny(db, context, action="annotation.create", status_code=400,
+              reason_code="not_found", message="作业数据不存在",
+              operation_data_id=data.operation_data_id, entity="annotation")
     existing = db.query(Annotation).filter(Annotation.operation_data_id == data.operation_data_id).first()
     if existing:
-        raise HTTPException(status_code=400, detail="该作业数据已存在标注记录，请使用更新接口")
+        _deny(db, context, action="annotation.create", status_code=400,
+              reason_code="already_annotated",
+              message="该作业数据已存在标注记录，请使用更新接口",
+              operation_data_id=data.operation_data_id, entity="annotation",
+              entity_id=existing.id)
 
     if not data.is_success and not data.failure_category:
-        raise HTTPException(status_code=400, detail="标注失败时必须指定失败大类")
+        _deny(db, context, action="annotation.create", status_code=400,
+              reason_code="invalid_payload", message="标注失败时必须指定失败大类",
+              operation_data_id=data.operation_data_id, entity="annotation")
 
-    annotation = Annotation(**data.model_dump())
+    annotation = Annotation(**_normalize_payload(data.model_dump()))
     db.add(annotation)
-    db.commit()
+    db.flush()
+    db.refresh(annotation)
+    after = snapshot(annotation, ANNOTATION_FIELDS)
+    record_change(
+        db,
+        context,
+        action="annotation.create",
+        operation_data_id=annotation.operation_data_id,
+        entity="annotation",
+        entity_id=annotation.id,
+        changes=field_changes({}, after, ANNOTATION_FIELDS, ANNOTATION_SENSITIVE),
+        raw_after=after,
+    )
+    _commit_or_deny(db, context, action="annotation.create",
+                    message="标注创建被数据库拒绝",
+                    operation_data_id=annotation.operation_data_id,
+                    entity="annotation", entity_id=annotation.id)
     db.refresh(annotation)
     return annotation
 
 
 @router.put("/annotations/{annotation_id}", response_model=AnnotationResponse, tags=["标注管理"])
-def update_annotation(annotation_id: int, data: AnnotationUpdate, db: Session = Depends(get_db)):
+def update_annotation(
+    annotation_id: int,
+    data: AnnotationUpdate,
+    db: Session = Depends(get_db),
+    context: AuditContext = Depends(require_writer_role),
+):
     annotation = db.query(Annotation).filter(Annotation.id == annotation_id).first()
     if not annotation:
-        raise HTTPException(status_code=404, detail="标注记录不存在")
-    update_data = data.model_dump(exclude_unset=True)
+        _deny(db, context, action="annotation.update", status_code=404,
+              reason_code="not_found", message="标注记录不存在",
+              entity="annotation", entity_id=annotation_id)
+
+    before = snapshot(annotation, ANNOTATION_FIELDS)
+    update_data = _normalize_payload(data.model_dump(exclude_unset=True))
     for field, value in update_data.items():
         setattr(annotation, field, value)
-    db.commit()
+    db.flush()
+    db.refresh(annotation)
+    after = snapshot(annotation, ANNOTATION_FIELDS)
+
+    changes = field_changes(before, after, ANNOTATION_FIELDS, ANNOTATION_SENSITIVE)
+    if not changes:
+        _deny(db, context, action="annotation.update", status_code=400,
+              reason_code="no_change", message="请求没有改变任何字段",
+              operation_data_id=annotation.operation_data_id,
+              entity="annotation", entity_id=annotation_id)
+
+    record_change(
+        db,
+        context,
+        action="annotation.update",
+        operation_data_id=annotation.operation_data_id,
+        entity="annotation",
+        entity_id=annotation.id,
+        changes=changes,
+        raw_before=before,
+        raw_after=after,
+    )
+    _commit_or_deny(db, context, action="annotation.create",
+                    message="标注创建被数据库拒绝",
+                    operation_data_id=annotation.operation_data_id,
+                    entity="annotation", entity_id=annotation.id)
     db.refresh(annotation)
     return annotation
 
 
 @router.delete("/annotations/{annotation_id}", tags=["标注管理"])
-def delete_annotation(annotation_id: int, db: Session = Depends(get_db)):
+def delete_annotation(
+    annotation_id: int,
+    db: Session = Depends(get_db),
+    context: AuditContext = Depends(require_writer_role),
+):
     annotation = db.query(Annotation).filter(Annotation.id == annotation_id).first()
     if not annotation:
-        raise HTTPException(status_code=404, detail="标注记录不存在")
+        _deny(db, context, action="annotation.delete", status_code=404,
+              reason_code="not_found", message="标注记录不存在",
+              entity="annotation", entity_id=annotation_id)
+
+    before = snapshot(annotation, ANNOTATION_FIELDS)
+    operation_data_id = annotation.operation_data_id
+    record_change(
+        db,
+        context,
+        action="annotation.delete",
+        operation_data_id=operation_data_id,
+        entity="annotation",
+        entity_id=annotation.id,
+        changes={"existence": {"before": "present", "after": "deleted"}},
+        raw_before=before,
+    )
     db.delete(annotation)
-    db.commit()
+    _commit_or_deny(db, context, action="annotation.delete",
+                    message="标注删除被数据库拒绝",
+                    operation_data_id=operation_data_id,
+                    entity="annotation", entity_id=annotation.id)
     return {"message": "删除成功"}
 
 

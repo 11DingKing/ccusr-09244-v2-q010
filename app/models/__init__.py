@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, event, DDL
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -224,3 +224,65 @@ class DatasetSubscription(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+
+
+class ChangeEvent(Base):
+    """不可变的作业变更时间线条目。
+
+    仅允许追加（INSERT）。数据库触发器拒绝任何 UPDATE/DELETE 尝试，
+    审计服务本身的拒绝事件也以独立事务写入，避免伪装成成功变更。
+    """
+
+    __tablename__ = "change_events"
+
+    # 单调递增的追加序号（SQLite AUTOINCREMENT，重启后继续增长且不复用），
+    # 与 happened_at 共同构成稳定排序键；主键本身只允许追加
+    seq = Column(Integer, primary_key=True, autoincrement=True)
+    correlation_id = Column(String(64), nullable=False, index=True)
+    # 针对不存在资源的拒绝请求可能没有作业 ID
+    operation_data_id = Column(Integer, nullable=True, index=True)
+    action = Column(String(32), nullable=False, index=True)
+    entity = Column(String(32), nullable=False, default="operation_data")
+    entity_id = Column(Integer, nullable=True)
+
+    # 业务发生时间（由服务端按请求时刻记录，客户端不可篡改）
+    happened_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    recorded_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    operator_id = Column(String(100), nullable=True, index=True)
+    operator_role = Column(String(32), nullable=False, default="anonymous")
+    request_source = Column(String(100), nullable=False, default="unknown")
+    client_request_id = Column(String(100), nullable=True)
+
+    # success=False 表示该请求被拒绝；前后差异为空，只记录拒绝事实
+    success = Column(Boolean, nullable=False, default=True, index=True)
+    reason_code = Column(String(64), nullable=True)
+    reason_detail = Column(Text, nullable=True)
+
+    # 脱敏后的字段级差异，对所有调用方可见
+    changes = Column(JSON, nullable=True)
+    # 完整前后快照，仅审计管理员可通过独立接口读取
+    raw_before = Column(JSON, nullable=True)
+    raw_after = Column(JSON, nullable=True)
+
+
+def _install_change_events_guards():  # pragma: no cover - 触发器在 SQLite 内部执行
+    """在数据库层拒绝对变更时间线的 UPDATE/DELETE。"""
+    table = ChangeEvent.__table__
+    create_update = DDL(
+        "CREATE TRIGGER IF NOT EXISTS change_events_no_update "
+        "BEFORE UPDATE ON change_events "
+        "BEGIN SELECT RAISE(ABORT, 'change_events 是不可变的变更时间线，禁止更新'); END"
+    )
+    create_delete = DDL(
+        "CREATE TRIGGER IF NOT EXISTS change_events_no_delete "
+        "BEFORE DELETE ON change_events "
+        "BEGIN SELECT RAISE(ABORT, 'change_events 是不可变的变更时间线，禁止删除'); END"
+    )
+    event.listen(table, "after_create", create_update)
+    event.listen(table, "after_create", create_delete)
+    event.listen(table, "after_drop", DDL("DROP TRIGGER IF EXISTS change_events_no_update"))
+    event.listen(table, "after_drop", DDL("DROP TRIGGER IF EXISTS change_events_no_delete"))
+
+
+_install_change_events_guards()
